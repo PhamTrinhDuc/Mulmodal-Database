@@ -1,5 +1,5 @@
 """
-indexing.py — Offline pipeline: build table, create vector index, insert embeddings.
+indexing.py — Offline pipeline: insert data và build vector index.
 
 Supported index modes:
   - ivfflat : IVFFlat (inverted file, approximate, good for large datasets)
@@ -13,174 +13,91 @@ Usage (CLI):
 import argparse
 import pickle
 
-import numpy as np
 import pandas as pd
-import psycopg2
-from pgvector.psycopg2 import register_vector
 from psycopg2.extras import execute_values
 
+from database import create_index, create_tables, drop_index, get_connection
 from feature_extraction import build_vector, normalize_feature_columns, process_dataset
 
 SKIP_META_COLS = {"label", "file_id", "duration_s", "sample_rate"}
 
-DB_CONFIG = {
-    "host": "localhost",
-    "port": 5433,
-    "dbname": "mydb",
-    "user": "admin",
-    "password": "admin123",
-}
-
-VECTOR_DIM = 108  # Phải khớp với số chiều vector từ build_vector()
-INDEX_NAME = "bird_sounds_embedding_idx"
-
-def get_connection():
-    conn = psycopg2.connect(**DB_CONFIG)
-    register_vector(conn)
-    return conn
-
-def create_tables(conn, feature_cols: list[str]):
-    """
-    Tạo 2 bảng:
-
-    bird_sounds  — metadata + embedding vector (dùng cho ANN search)
-        id, file_id, label, duration_s, sample_rate, embedding
-
-    bird_features — giá trị từng feature scalar gốc (dùng để inspect / filter)
-        id, bird_id FK→bird_sounds.id, <108 feature columns>
-    """
-    # Sinh DDL cho 108 cột feature của bảng bird_features
-    feature_col_defs = ",\n                ".join(f'"{col}" FLOAT' for col in feature_cols)
-
-    with conn.cursor() as cur:
-        cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-
-        # Bảng 1: siêu dữ liệu + embedding
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS bird_sounds (
-                id          SERIAL PRIMARY KEY,
-                file_id     INT,
-                label       TEXT,
-                duration_s  FLOAT,
-                sample_rate INT,
-                embedding   vector({VECTOR_DIM})
-            );
-        """)
-
-        # Bảng 2: giá trị feature scalar (raw, trước normalize)
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS bird_features (
-                id      SERIAL PRIMARY KEY,
-                bird_id INT REFERENCES bird_sounds(id) ON DELETE CASCADE,
-                {feature_col_defs}
-            );
-        """)
-
-        conn.commit()
-    print("Tables bird_sounds + bird_features created (or already exist.)")
-
-def drop_index(conn):
-    """Xóa index cũ nếu tồn tại (để tạo lại với mode khác)."""
-    with conn.cursor() as cur:
-        cur.execute(f"DROP INDEX IF EXISTS {INDEX_NAME};")
-        conn.commit()
-    print(f"Dropped index '{INDEX_NAME}' (if existed).")
-
-
-def create_index(
-    conn,
-    mode: str = "ivfflat",
-    # IVFFlat params
-    lists: int = 40,
-    # HNSW params
-    m: int = 16,
-    ef_construction: int = 64,
-):
-    """
-    Tạo vector index cho bảng bird_sounds.
-
-    Args:
-        mode           : "ivfflat" hoặc "hnsw"
-        lists          : (IVFFlat) số cluster, thường ~ sqrt(n_records)
-        m              : (HNSW) số liên kết mỗi node, tăng -> chính xác hơn / tốn RAM hơn
-        ef_construction: (HNSW) kích thước beam khi xây đồ thị, lớn hơn -> chậm build / chính xác hơn
-    """
-    mode = mode.lower()
-    if mode not in ("ivfflat", "hnsw"):
-        raise ValueError(f"Unsupported index mode: '{mode}'. Choose 'ivfflat' or 'hnsw'.")
-
-    with conn.cursor() as cur:
-        if mode == "ivfflat":
-            sql = f"""
-                CREATE INDEX IF NOT EXISTS {INDEX_NAME}
-                ON bird_sounds
-                USING ivfflat (embedding vector_cosine_ops)
-                WITH (lists = {lists});
-            """
-            print(f"Creating IVFFlat index (lists={lists}) ...")
-        else:  # hnsw
-            sql = f"""
-                CREATE INDEX IF NOT EXISTS {INDEX_NAME}
-                ON bird_sounds
-                USING hnsw (embedding vector_cosine_ops)
-                WITH (m = {m}, ef_construction = {ef_construction});
-            """
-            print(f"Creating HNSW index (m={m}, ef_construction={ef_construction}) ...")
-
-        cur.execute(sql)
-        conn.commit()
-
-    print(f"Index '{INDEX_NAME}' ({mode}) created successfully.")
 
 def insert_records(conn, records: list[dict], feature_cols: list[str]):
     """
-    Bulk-insert vào 2 bảng bird_sounds và bird_features.
+    Bulk-insert vào 4 bảng theo schema mới.
 
     records: list of dict với keys:
-        file_id    (int)
-        label      (str)
+        file_id    (int)    — index trong parquet
+        label      (str)    — tên loài chim (species_name)
         duration_s (float)  — độ dài audio sau preprocess (giây)
         sample_rate(int)    — sample rate sau preprocess
         embedding  (np.ndarray float32) — L2-normalized vector
         features   (dict)   — raw scalar values {col: float} trước normalize
     """
-    # ── Step 1: insert bird_sounds, lấy lại id vừa tạo ──────────────────────
-    sound_rows = [
-        (r["file_id"], r["label"], r["duration_s"], r["sample_rate"], r["embedding"])
+    # ── Step 1: Upsert birds (theo species_name) ─────────────────────────────
+    unique_species = list({r["label"] for r in records})
+    with conn.cursor() as cur:
+        execute_values(
+            cur,
+            "INSERT INTO birds (species_name) VALUES %s ON CONFLICT (species_name) DO NOTHING",
+            [(s,) for s in unique_species],
+        )
+        cur.execute(
+            "SELECT id, species_name FROM birds WHERE species_name = ANY(%s)",
+            (unique_species,),
+        )
+        species_id_map = {row[1]: row[0] for row in cur.fetchall()}
+
+    # ── Step 2: Insert audio_files, lấy lại id ───────────────────────────────
+    audio_rows = [
+        (
+            species_id_map[r["label"]],
+            f"parquet/{r['file_id']}",   # dùng để tra cứu lại row trong parquet
+            r["sample_rate"],
+            r["duration_s"],
+        )
         for r in records
     ]
     with conn.cursor() as cur:
-        ids = execute_values(
+        audio_id_rows = execute_values(
             cur,
             """
-            INSERT INTO bird_sounds (file_id, label, duration_s, sample_rate, embedding)
+            INSERT INTO audio_files (bird_id, file_path, sample_rate, duration_s)
             VALUES %s
             RETURNING id
             """,
-            sound_rows,
-            template="(%s, %s, %s, %s, %s::vector)",
-            fetch=True,          # trả về RETURNING rows
+            audio_rows,
+            fetch=True,
         )
-    bird_ids = [row[0] for row in ids]
+    audio_ids = [row[0] for row in audio_id_rows]
 
-    # ── Step 2: insert bird_features với raw scalar values ──────────────────
+    # ── Step 3: Insert acoustic_features (raw scalar, trước normalize) ───────
     col_names = ", ".join(f'"{c}"' for c in feature_cols)
     value_placeholders = ", ".join(["%s"] * len(feature_cols))
-
     feature_rows = [
-        [bird_id] + [float(r["features"][col]) for col in feature_cols]
-        for bird_id, r in zip(bird_ids, records)
+        [audio_id] + [float(r["features"][col]) for col in feature_cols]
+        for audio_id, r in zip(audio_ids, records)
     ]
     with conn.cursor() as cur:
         execute_values(
             cur,
-            f"INSERT INTO bird_features (bird_id, {col_names}) VALUES %s",
+            f'INSERT INTO acoustic_features (audio_id, {col_names}) VALUES %s',
             feature_rows,
             template=f"(%s, {value_placeholders})",
         )
+
+    # ── Step 4: Insert embeddings (L2-normalized vector) ─────────────────────
+    embedding_rows = [(audio_id, r["embedding"]) for audio_id, r in zip(audio_ids, records)]
+    with conn.cursor() as cur:
+        execute_values(
+            cur,
+            "INSERT INTO embeddings (audio_id, embedding) VALUES %s",
+            embedding_rows,
+            template="(%s, %s::vector)",
+        )
         conn.commit()
 
-    print(f"Inserted {len(records)} records into bird_sounds + bird_features.")
+    print(f"Inserted {len(records)} records into birds / audio_files / acoustic_features / embeddings.")
 
 # ---------------------------------------------------------------------------
 # End-to-end offline pipeline
@@ -256,7 +173,7 @@ def run_indexing(
 
 if __name__ == "__main__":
 
-    DATA_PATH = "/home/ducpham/workspace/PTIT-CSDLDPT/data/0000.parquet"
+    DATA_PATH = "/home/ducpham/workspace/PTIT-CSDLDPT/data/index.parquet"
     STATS_PATH = "/home/ducpham/workspace/PTIT-CSDLDPT/data/feature_stats.pkl"
 
     parser = argparse.ArgumentParser(description="Offline indexing pipeline for bird_sounds.")

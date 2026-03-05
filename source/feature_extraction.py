@@ -192,39 +192,67 @@ def build_vector(row, feature_cols):
 # Online — single audio file
 # ---------------------------------------------------------------------------
 
-def process_single_audio(audio_bytes: bytes, stats: dict) -> np.ndarray:
+def process_single_audio(audio_bytes: bytes, stats: dict, verbose: bool = False):
     """
     [ONLINE] Trích xuất embedding từ một file âm thanh (bytes) dùng để query.
 
-    Pipeline:
-        preprocess → extract_features → flatten → StandardScaler (dùng stats đã lưu) → build_vector (L2)
-
     Args:
         audio_bytes : raw audio file content (bytes)
-        stats       : dict đọc từ feature_stats.pkl (được tạo lúc indexing offline)
-                      format: {col_name: {'mean': float, 'std': float}, ...}
-
-    Returns:
-        np.ndarray float32, shape (VECTOR_DIM,) — sẵn sàng để query pgvector
+        stats       : dict đọc từ feature_stats.pkl
+        verbose     : nếu True, trả về dict với kết quả trung gian từng bước;
+                      nếu False (mặc định), trả về np.ndarray embedding.
     """
-    audio_data, sr = librosa.load(io.BytesIO(audio_bytes), sr=None, mono=True)
-    audio_data, sr = preprocess_audio(audio_data, sr)
-    raw_features = extract_features(audio_data, sr)
+    _MAX_PTS = 2000  # giới hạn điểm waveform để JSON không quá lớn
 
+    # ── 1. Load raw ──────────────────────────────────────────────────────────
+    audio_raw, sr_raw = librosa.load(io.BytesIO(audio_bytes), sr=None, mono=True)
+    duration_before = len(audio_raw) / sr_raw
+
+    # ── 2. Preprocess ────────────────────────────────────────────────────────
+    audio_data, sr = preprocess_audio(audio_raw, sr_raw)
+    duration_after = len(audio_data) / sr
+
+    # ── 3. Feature extraction ────────────────────────────────────────────────
+    raw_features = extract_features(audio_data, sr)
     if not raw_features:
         raise ValueError("Feature extraction returned empty result for the given audio.")
-
     flat = flatten_features(raw_features)
 
-    # Apply StandardScaler dùng stats từ offline — chỉ giữ các cột đã được index
+    # ── 4. Normalize (StandardScaler) ────────────────────────────────────────
     feature_cols = [c for c in stats.keys() if c in flat]
-    row = {}
+    flat_normalized = {}
     for col in feature_cols:
         mean = stats[col]["mean"]
         std = stats[col]["std"] if stats[col]["std"] > 0 else 1.0
-        row[col] = (flat[col] - mean) / std
+        flat_normalized[col] = (flat[col] - mean) / std
 
-    return build_vector(row, feature_cols)
+    # ── 5. Build L2-normalized embedding ─────────────────────────────────────
+    embedding = build_vector(flat_normalized, feature_cols)
+
+    if not verbose:
+        return embedding
+
+    # ── Verbose: trả về dict kết quả trung gian ──────────────────────────────
+    def _down(arr):
+        step = max(1, len(arr) // _MAX_PTS)
+        return arr[::step].tolist()
+
+    return {
+        "embedding": embedding.tolist(),
+        "steps": {
+            "preprocessing": {
+                "duration_before_s": round(duration_before, 4),
+                "duration_after_s": round(duration_after, 4),
+                "sample_rate": sr,
+                "waveform_before": _down(audio_raw),
+                "waveform_after": _down(audio_data),
+            },
+            "features_raw": {k: round(float(flat[k]), 6) for k in feature_cols},
+            "features_normalized": {k: round(float(flat_normalized[k]), 6) for k in feature_cols},
+            "embedding_norm": round(float(np.linalg.norm(embedding)), 6),
+            "embedding": embedding.tolist(),
+        },
+    }
 
 
 if __name__ == "__main__":

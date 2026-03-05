@@ -16,24 +16,9 @@ import pickle
 
 import numpy as np
 import pandas as pd
-import psycopg2
-from pgvector.psycopg2 import register_vector
 
+from database import get_connection
 from feature_extraction import process_single_audio
-
-DB_CONFIG = {
-    "host": "localhost",
-    "port": 5433,
-    "dbname": "mydb",
-    "user": "admin",
-    "password": "admin123",
-}
-
-
-def get_connection():
-    conn = psycopg2.connect(**DB_CONFIG)
-    register_vector(conn)
-    return conn
 
 def search_similar(
     conn,
@@ -79,10 +64,12 @@ def search_similar(
         if filter_label:
             cur.execute(
                 """
-                SELECT id, file_id, label,
-                       embedding <=> %s::vector AS distance
-                FROM bird_sounds
-                WHERE label = %s
+                SELECT e.id, af.id, b.species_name,
+                       e.embedding <=> %s::vector AS distance
+                FROM embeddings e
+                JOIN audio_files af ON af.id = e.audio_id
+                JOIN birds b ON b.id = af.bird_id
+                WHERE b.species_name = %s
                 ORDER BY distance
                 LIMIT %s;
                 """,
@@ -91,9 +78,11 @@ def search_similar(
         else:
             cur.execute(
                 """
-                SELECT id, file_id, label,
-                       embedding <=> %s::vector AS distance
-                FROM bird_sounds
+                SELECT e.id, af.id, b.species_name,
+                       e.embedding <=> %s::vector AS distance
+                FROM embeddings e
+                JOIN audio_files af ON af.id = e.audio_id
+                JOIN birds b ON b.id = af.bird_id
                 ORDER BY distance
                 LIMIT %s;
                 """,
@@ -104,8 +93,8 @@ def search_similar(
 
     return [
         {
-            "id": r[0],
-            "file_id": r[1],
+            "embedding_id": r[0],
+            "audio_id": r[1],  # audio_files.id
             "label": r[2],
             "distance": round(float(r[3]), 6),
             "similarity": round(1 - float(r[3]), 6),
